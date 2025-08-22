@@ -1,7 +1,7 @@
 import io
 import os
 from datetime import date
-from typing import List, Dict, Tuple, Iterable
+from typing import List, Dict, Tuple, Iterable, Optional
 import itertools
 import math
 
@@ -21,7 +21,6 @@ try:
 except Exception:
     REPORTLAB_AVAILABLE = False
 
-# -------------------- Constants --------------------
 TRADING_DAYS = 252
 
 DEFAULT_TOP40 = [
@@ -33,7 +32,6 @@ DEFAULT_TOP40 = [
     "SOL.JO","PPH.JO","GRT.JO","RDF.JO"
 ]
 
-# -------------------- Helpers --------------------
 def pct(x: float) -> str:
     return f"{x*100:.2f}%"
 
@@ -76,66 +74,84 @@ def apply_turnover_costs(daily_returns: pd.Series, positions: pd.Series, cost_bp
     turnover = pos.diff().abs().fillna(pos.abs())
     return daily_returns - (cost_bps / 10000.0) * turnover
 
-def download_prices(tickers: List[str], start: str, end: str) -> pd.DataFrame:
-    data = yf.download(sorted(set(tickers)), start=start, end=end, auto_adjust=True, progress=False)
-    if data.empty:
+def download_prices(tickers: List[str], start: str, end: str, batch_size: int = 10) -> pd.DataFrame:
+    # Download in batches to avoid API limits
+    all_px = []
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        try:
+            data = yf.download(sorted(set(batch)), start=start, end=end, auto_adjust=True, progress=False)
+            if data.empty:
+                continue
+            if isinstance(data.columns, pd.MultiIndex):
+                px = data["Close"].copy()
+            else:
+                px = data[["Close"]].copy()
+            px.columns = [c if isinstance(c, str) else c[1] for c in px.columns]
+            all_px.append(px)
+        except Exception as e:
+            st.warning(f"Error downloading batch {batch}: {e}")
+    if not all_px:
         return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        px = data["Close"].copy()
-    else:
-        # Single ticker case
-        px = data[["Close"]].copy()
-    px.columns = [c if isinstance(c, str) else c[1] for c in px.columns]
-    return px.dropna(how="all")
+    return pd.concat(all_px, axis=1).dropna(how="all")
 
 def parse_uploaded_tickers(file) -> List[str]:
     if file is None:
         return []
     name = file.name.lower()
     content = file.read().decode("utf-8", errors="ignore")
-    if name.endswith(".csv"):
-        # Accept either one ticker per row, or a column named "ticker"
-        try:
-            df = pd.read_csv(io.StringIO(content))
-            if "ticker" in df.columns:
-                return [t.strip() for t in df["ticker"].astype(str).tolist() if t and isinstance(t, str)]
-            # else assume first column
-            return [t.strip() for t in df.iloc[:,0].astype(str).tolist() if t and isinstance(t, str)]
-        except Exception:
-            # fallback: try comma/newline split
-            pass
-    # TXT or fallback
+    # Try CSV first
+    try:
+        df = pd.read_csv(io.StringIO(content))
+        if "ticker" in df.columns:
+            return [t.strip() for t in df["ticker"].astype(str).tolist() if t and isinstance(t, str)]
+        return [t.strip() for t in df.iloc[:,0].astype(str).tolist() if t and isinstance(t, str)]
+    except Exception:
+        pass
+    # Fallback: TXT or comma/newline split
     sep = "," if "," in content else "\n"
     return [t.strip() for t in content.split(sep) if t.strip()]
 
 # -------------------- Strategies --------------------
-def strat_mean_reversion_bbands(close: pd.Series, lookback: int, z_entry: float, z_exit: float):
+def strat_mean_reversion_bbands(
+    close: pd.Series, lookback: int, z_entry: float, z_exit: float
+) -> Tuple[pd.Series, pd.Series]:
+    if len(close) < lookback + 5:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     ma = close.rolling(lookback).mean()
     sd = close.rolling(lookback).std()
     z = (close - ma) / sd
-    pos = pd.Series(0.0, index=close.index)
+    pos = np.zeros(len(close))
     in_pos = False
-    for i in range(len(close)):
-        zi = z.iloc[i]
+    for i, zi in enumerate(z):
         if not in_pos and zi <= -z_entry:
             in_pos = True
         elif in_pos and zi >= -z_exit:
             in_pos = False
-        pos.iloc[i] = 1.0 if in_pos else 0.0
-    ret = close.pct_change().fillna(0.0) * pos.shift(1).fillna(0.0)
-    return ret, pos
+        pos[i] = 1.0 if in_pos else 0.0
+    pos_series = pd.Series(pos, index=close.index)
+    ret = close.pct_change().fillna(0.0) * pos_series.shift(1).fillna(0.0)
+    return ret, pos_series
 
-def strat_trend_ema_crossover(close: pd.Series, short: int, long: int):
+def strat_trend_ema_crossover(
+    close: pd.Series, short: int, long: int
+) -> Tuple[pd.Series, pd.Series]:
+    if len(close) < long + 5:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     ema_s = close.ewm(span=short, adjust=False).mean()
     ema_l = close.ewm(span=long, adjust=False).mean()
     pos = (ema_s > ema_l).astype(float)
     ret = close.pct_change().fillna(0.0) * pos.shift(1).fillna(0.0)
     return ret, pos
 
-def strat_breakout_donchian(close: pd.Series, entry: int, exit_: int):
+def strat_breakout_donchian(
+    close: pd.Series, entry: int, exit_: int
+) -> Tuple[pd.Series, pd.Series]:
+    if len(close) < max(entry, exit_) + 5:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     hh = close.rolling(entry).max()
     ll = close.rolling(exit_).min()
-    pos = pd.Series(0.0, index=close.index)
+    pos = np.zeros(len(close))
     in_pos = False
     for i in range(len(close)):
         c = close.iloc[i]
@@ -143,33 +159,37 @@ def strat_breakout_donchian(close: pd.Series, entry: int, exit_: int):
             in_pos = True
         elif in_pos and i > 0 and c < ll.iloc[i-1]:
             in_pos = False
-        pos.iloc[i] = 1.0 if in_pos else 0.0
-    ret = close.pct_change().fillna(0.0) * pos.shift(1).fillna(0.0)
-    return ret, pos
+        pos[i] = 1.0 if in_pos else 0.0
+    pos_series = pd.Series(pos, index=close.index)
+    ret = close.pct_change().fillna(0.0) * pos_series.shift(1).fillna(0.0)
+    return ret, pos_series
 
-def strat_pairs_spread_z(x_close: pd.Series, y_close: pd.Series, lookback: int, z_entry: float, z_exit: float):
+def strat_pairs_spread_z(
+    x_close: pd.Series, y_close: pd.Series, lookback: int, z_entry: float, z_exit: float
+) -> Tuple[pd.Series, pd.Series]:
     idx = x_close.index.intersection(y_close.index)
     x, y = x_close.reindex(idx).ffill(), y_close.reindex(idx).ffill()
+    if len(x) < lookback + 5 or len(y) < lookback + 5:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     lx, ly = np.log(x), np.log(y)
     spread = lx - ly
     m = spread.rolling(lookback).mean()
     s = spread.rolling(lookback).std()
     z = (spread - m) / s
 
-    pos = pd.Series(0.0, index=idx)
+    pos = np.zeros(len(idx))
     state = 0
-    for i in range(len(idx)):
-        zi = z.iloc[i]
+    for i, zi in enumerate(z):
         if state == 0:
             if zi <= -z_entry: state = +1
             elif zi >=  z_entry: state = -1
         else:
             if abs(zi) <= z_exit: state = 0
-        pos.iloc[i] = float(state)
-
+        pos[i] = float(state)
+    pos_series = pd.Series(pos, index=idx)
     rx, ry = x.pct_change().fillna(0.0), y.pct_change().fillna(0.0)
-    pnl = pos.shift(1).fillna(0.0) * (rx - ry)
-    turnover = pos.diff().abs().fillna(pos.abs()) * 2.0   # two legs
+    pnl = pos_series.shift(1).fillna(0.0) * (rx - ry)
+    turnover = pos_series.diff().abs().fillna(pos_series.abs()) * 2.0   # two legs
     return pnl, turnover
 
 def equal_weight_portfolio(returns_dict: Dict[str, pd.Series]) -> pd.Series:
@@ -212,7 +232,6 @@ def build_summary_block(name: str, c: float, s: float, dd: float, ddd: int) -> s
     lines.append(f"- Sharpe (risk-adjusted return): {s:.2f}. {explain_sharpe(s)}")
     lines.append(f"- Maximum Drawdown (worst loss): {pct(dd)}. {explain_maxdd(dd)}")
     lines.append(f"- Drawdown Days (time to recover): {ddd} days. {explain_dd_days(ddd)}")
-    # Basic recommendations
     recs = []
     if s >= 1.0 and dd > -0.30:
         recs.append("Good candidate for live use with sensible position sizing.")
@@ -246,7 +265,6 @@ with st.sidebar:
     else:
         tickers = DEFAULT_TOP40.copy()
 
-    # Allow manual edits/confirmation
     tickers_text = st.text_area("Tickers (comma-separated)", value=", ".join(tickers))
     tickers = [t.strip() for t in tickers_text.split(",") if t.strip()]
 
@@ -268,33 +286,28 @@ with st.sidebar:
     st.caption("Tip: Start with Mean Reversion + Trend; add Breakout/Pairs later.")
 
     st.header("5) Parameters")
-    # Mean Reversion params
     st.subheader("Mean Reversion")
     mr_lb = st.slider("MR lookback (days)", 10, 60, 20, step=1)
     mr_z_entry = st.slider("MR entry z-score (buy below)", 0.5, 3.0, 1.5, step=0.1)
     mr_z_exit  = st.slider("MR exit z-score (flat above)", 0.1, 2.0, 0.5, step=0.1)
 
-    # Trend params
     st.subheader("Trend Following")
     tf_short = st.slider("EMA short", 10, 150, 50, step=5)
     tf_long  = st.slider("EMA long", 100, 300, 200, step=5)
 
-    # Breakout params
     st.subheader("Breakout")
     bo_entry = st.slider("Entry lookback (N-day high)", 10, 120, 55, step=1)
     bo_exit  = st.slider("Exit lookback (M-day low)", 5, 60, 20, step=1)
 
-    # Pairs params
     st.subheader("Pairs")
-    pair_x = st.selectbox("Leg X", options=tickers, index=min(0, len(tickers)-1) if tickers else 0)
-    pair_y = st.selectbox("Leg Y", options=tickers, index=min(1, len(tickers)-1) if len(tickers) > 1 else 0)
+    pair_x = st.selectbox("Leg X", options=tickers, index=0 if tickers else 0)
+    pair_y = st.selectbox("Leg Y", options=tickers, index=1 if len(tickers) > 1 else 0)
     pairs_lb = st.slider("Pairs lookback", 20, 120, 60, step=5)
     pairs_z_entry = st.slider("Pairs entry z", 0.5, 3.0, 2.0, step=0.1)
     pairs_z_exit  = st.slider("Pairs exit z", 0.1, 2.0, 0.5, step=0.1)
 
     run_btn = st.button("▶ Run Backtest")
 
-# -------------------- Run Backtest --------------------
 if run_btn:
     if not tickers:
         st.error("Please provide at least one ticker.")
@@ -303,73 +316,70 @@ if run_btn:
     st.info("Downloading price data…")
     px = download_prices(tickers, start_date.isoformat(), end_date.isoformat())
     if px.empty:
-        st.error("No price data found. Check tickers or date range.")
+        st.error("No price data found. Check tickers or date range. Try fewer tickers or a different date range.")
         st.stop()
 
-    # Ensure enough data for long EMA
     px = px.dropna(how="all")
     dates = px.index
 
     results: Dict[str, pd.Series] = {}
     english_blocks: Dict[str, str] = {}
 
-    # Mean Reversion portfolio
     if use_mr:
         per_ticker = {}
         for t in px.columns:
             s = px[t].dropna()
-            if len(s) < max(220, mr_lb+5):
-                continue
             r, p = strat_mean_reversion_bbands(s, mr_lb, mr_z_entry, mr_z_exit)
+            if r.empty:
+                continue
             r_cost = apply_turnover_costs(r, p, total_bps)
             per_ticker[t] = r_cost.reindex(dates).fillna(0.0)
         if per_ticker:
             port = equal_weight_portfolio(per_ticker)
             results["Mean Reversion"] = port
 
-    # Trend Following portfolio
     if use_tf:
         per_ticker = {}
         for t in px.columns:
             s = px[t].dropna()
-            if len(s) < max(220, tf_long+5):
-                continue
             r, p = strat_trend_ema_crossover(s, tf_short, tf_long)
+            if r.empty:
+                continue
             r_cost = apply_turnover_costs(r, p, total_bps)
             per_ticker[t] = r_cost.reindex(dates).fillna(0.0)
         if per_ticker:
             port = equal_weight_portfolio(per_ticker)
             results["Trend EMA"] = port
 
-    # Breakout portfolio
     if use_bo:
         per_ticker = {}
         for t in px.columns:
             s = px[t].dropna()
-            if len(s) < max(220, bo_entry+5, bo_exit+5):
-                continue
             r, p = strat_breakout_donchian(s, bo_entry, bo_exit)
+            if r.empty:
+                continue
             r_cost = apply_turnover_costs(r, p, total_bps)
             per_ticker[t] = r_cost.reindex(dates).fillna(0.0)
         if per_ticker:
             port = equal_weight_portfolio(per_ticker)
             results["Breakout Donchian"] = port
 
-    # Pairs
     if use_pairs and pair_x in px.columns and pair_y in px.columns and pair_x != pair_y:
         x = px[pair_x].dropna()
         y = px[pair_y].dropna()
         r_pairs, turn_pairs = strat_pairs_spread_z(x, y, pairs_lb, pairs_z_entry, pairs_z_exit)
-        r_pairs = r_pairs.reindex(dates).fillna(0.0)
-        cost_per_day = (total_bps / 10000.0) * turn_pairs.reindex(dates).fillna(0.0)
-        port_pairs = r_pairs - cost_per_day
-        results[f"Pairs {pair_x}/{pair_y}"] = port_pairs
+        if r_pairs.empty:
+            st.warning("Pairs strategy: insufficient data for selected tickers or lookback.")
+        else:
+            r_pairs = r_pairs.reindex(dates).fillna(0.0)
+            cost_per_day = (total_bps / 10000.0) * turn_pairs.reindex(dates).fillna(0.0)
+            port_pairs = r_pairs - cost_per_day
+            results[f"Pairs {pair_x}/{pair_y}"] = port_pairs
 
     if not results:
-        st.warning("No strategies produced results (insufficient data after filters). Try different dates/params.")
+        st.warning("No strategies produced results (insufficient data after filters). Try different dates, tickers, or parameters.")
         st.stop()
 
-    # -------------------- Summaries --------------------
     rows = []
     for name, rets in results.items():
         eq = equity_curve(rets)
@@ -388,34 +398,27 @@ if run_btn:
         )[["CAGR","Sharpe","MaxDD","DD_Days"]]
     )
 
-    # -------------------- Plain-English Explanations --------------------
     st.subheader("Plain-English Explanations")
     for name in summary_df.index:
         with st.expander(name, expanded=True):
             st.text(english_blocks[name])
 
-    # -------------------- Equity Curves --------------------
     st.subheader("Equity Curves")
     fig, ax = plt.subplots(figsize=(11,6))
     for name, rets in results.items():
         eq = equity_curve(rets)
         ax.plot(eq, label=name)
     ax.set_title("Strategy Equity Curves")
+    ax.set_yscale("log")
     ax.legend()
     st.pyplot(fig)
 
-    # -------------------- Downloads --------------------
     st.subheader("Downloads")
-
-    # 1) CSV of summary
     csv_buf = io.StringIO()
     out_csv = summary_df.copy()
-    out_csv["CAGR"] = out_csv["CAGR"]
-    out_csv["MaxDD"] = out_csv["MaxDD"]
     out_csv.to_csv(csv_buf)
     st.download_button("Download Summary CSV", data=csv_buf.getvalue(), file_name="strategy_summary.csv", mime="text/csv")
 
-    # 2) Text report (always available)
     txt_report = io.StringIO()
     txt_report.write("JSE Strategy Report (Plain English)\n\n")
     txt_report.write(f"Date range: {start_date} to {end_date}\n")
@@ -428,7 +431,6 @@ if run_btn:
         txt_report.write(english_blocks[name] + "\n\n")
     st.download_button("Download TXT Report", data=txt_report.getvalue(), file_name="strategy_report.txt", mime="text/plain")
 
-    # 3) PDF report (if reportlab installed)
     if REPORTLAB_AVAILABLE:
         pdf_buf = io.BytesIO()
         doc = SimpleDocTemplate(pdf_buf, pagesize=A4, rightMargin=2*cm, leftMargin=2*cm, topMargin=2*cm, bottomMargin=2*cm)

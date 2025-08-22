@@ -2,7 +2,6 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = true
-# Streamlit will read PORT from the Procfile command
 
 [browser]
 gatherUsageStats = false
