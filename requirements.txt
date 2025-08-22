@@ -3,4 +3,4 @@ yfinance==0.2.52
 pandas==2.2.2
 numpy==1.26.4
 matplotlib==3.8.4
-reportlab==4.2.2      # optional; remove if you don’t want PDF export
+
